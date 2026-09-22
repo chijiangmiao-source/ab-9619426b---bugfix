@@ -341,6 +341,176 @@ class TestPlanner(unittest.TestCase):
             raw = make_raw(n, d, v, w, s0, sm, ids=ids)
             self.assertMatchesBrute(raw)
 
+    # ------------------------------------------------- reported regression
+
+    def _reported_payload(self):
+        """The 9-target case exposing cross-mask pruning (>= 512 DP states)."""
+        return {
+            "targets": [
+                {"id": 20, "duration": 1, "value": 10,
+                 "windows": [{"open": 0, "close": 10}]},
+                {"id": 10, "duration": 1, "value": 5,
+                 "windows": [{"open": 0, "close": 1}]},
+                {"id": 30, "duration": 1, "value": 1,
+                 "windows": [{"open": 0, "close": 10}]},
+                {"id": 40, "duration": 1, "value": 1,
+                 "windows": [{"open": 0, "close": 1}]},
+                {"id": 41, "duration": 1, "value": 1,
+                 "windows": [{"open": 0, "close": 1}]},
+                {"id": 42, "duration": 1, "value": 1,
+                 "windows": [{"open": 0, "close": 1}]},
+                {"id": 43, "duration": 1, "value": 1,
+                 "windows": [{"open": 0, "close": 1}]},
+                {"id": 44, "duration": 1, "value": 1,
+                 "windows": [{"open": 0, "close": 1}]},
+                {"id": 45, "duration": 1, "value": 1,
+                 "windows": [{"open": 0, "close": 1}]},
+            ],
+            "slew": {
+                "from_night_start": [0, 0, 100, 100, 100, 100, 100, 100, 100],
+                "between_targets": [
+                    [0, 100, 0, 100, 100, 100, 100, 100, 100],
+                    [100, 0, 4, 100, 100, 100, 100, 100, 100],
+                    [0, 100, 0, 100, 100, 100, 100, 100, 100],
+                    [100, 100, 100, 0, 100, 100, 100, 100, 100],
+                    [100, 100, 100, 100, 0, 100, 100, 100, 100],
+                    [100, 100, 100, 100, 100, 0, 100, 100, 100],
+                    [100, 100, 100, 100, 100, 100, 0, 100, 100],
+                    [100, 100, 100, 100, 100, 100, 100, 0, 100],
+                    [100, 100, 100, 100, 100, 100, 100, 100, 0],
+                ],
+            },
+        }
+
+    def _assert_reported_solution(self, res):
+        self.assertEqual(
+            res["objective"], {"total_value": 16, "final_end_time": 7}
+        )
+        self.assertFalse(res["empty_plan"])
+        self.assertEqual(res["optimal_target_set_count"], 1)
+        self.assertEqual(res["canonical_plan"]["target_ids"], [10, 30, 20])
+        statuses = {c["id"]: c["status"] for c in res["classifications"]}
+        for tid in (10, 20, 30):
+            self.assertEqual(statuses[tid], "required")
+        for tid in range(40, 46):
+            self.assertEqual(statuses[tid], "excluded")
+
+        steps = res["canonical_plan"]["steps"]
+        expected = [
+            # id, slew-from, slew-seconds, slew-finish, start, end, window
+            (10, "NIGHT_START", 0, 0, 0, 1, (0, 1)),
+            (30, 10, 4, 5, 5, 6, (0, 10)),
+            (20, 30, 0, 6, 6, 7, (0, 10)),
+        ]
+        self.assertEqual(len(steps), 3)
+        prev_end = 0
+        for step, (tid, frm, sec, fin, start, end, win) in zip(steps, expected):
+            self.assertEqual(step["id"], tid)
+            self.assertEqual(step["slew"]["from"], frm)
+            self.assertEqual(step["slew"]["seconds"], sec)
+            self.assertEqual(step["slew"]["finish_time"], fin)
+            self.assertEqual(step["start_time"], start)
+            self.assertEqual(step["end_time"], end)
+            self.assertEqual(step["exposure_seconds"], end - start)
+            self.assertEqual(
+                (step["window"]["open"], step["window"]["close"]), win
+            )
+            # Independently re-checkable time evidence.
+            self.assertEqual(fin, prev_end + sec)
+            self.assertGreaterEqual(start, fin)
+            self.assertLessEqual(win[0], start)
+            self.assertLessEqual(end, win[1])
+            prev_end = end
+
+    def test_reported_nine_target_case(self):
+        raw = self._reported_payload()
+        self._assert_reported_solution(plan(raw))
+        self.assertMatchesBrute(raw)
+
+    @staticmethod
+    def _reorder(raw, perm):
+        """Reorder targets and the slew arrays/matrix consistently."""
+        return {
+            "targets": [raw["targets"][i] for i in perm],
+            "slew": {
+                "from_night_start": [
+                    raw["slew"]["from_night_start"][i] for i in perm
+                ],
+                "between_targets": [
+                    [raw["slew"]["between_targets"][i][j] for j in perm]
+                    for i in perm
+                ],
+            },
+        }
+
+    def test_reported_case_independent_of_array_order(self):
+        raw = self._reported_payload()
+        n = len(raw["targets"])
+        rng = random.Random(90210)
+        for _ in range(20):
+            perm = list(range(n))
+            rng.shuffle(perm)
+            res = plan(self._reorder(raw, perm))
+            self._assert_reported_solution(res)
+            self.assertMatchesBrute(self._reorder(raw, perm))
+
+    def test_reported_case_relabeled_ids(self):
+        # Same business request, different id numbering: the unique optimal
+        # set and the 10 -> 30 -> 20 exposure pattern must survive; only the
+        # reported id numbers change.
+        remap = {20: 7, 10: 1, 30: 99, 40: 50, 41: 51, 42: 52,
+                 43: 53, 44: 54, 45: 55}
+        raw = self._reported_payload()
+        relabeled = {
+            "targets": [{**t, "id": remap[t["id"]]} for t in raw["targets"]],
+            "slew": raw["slew"],
+        }
+        res = plan(relabeled)
+        self.assertEqual(
+            res["objective"], {"total_value": 16, "final_end_time": 7}
+        )
+        self.assertEqual(res["optimal_target_set_count"], 1)
+        self.assertEqual(res["canonical_plan"]["target_ids"], [1, 99, 7])
+        statuses = {c["id"]: c["status"] for c in res["classifications"]}
+        for old, new in remap.items():
+            want = "required" if old in (10, 20, 30) else "excluded"
+            self.assertEqual(statuses[new], want)
+        steps = res["canonical_plan"]["steps"]
+        self.assertEqual(
+            [(s["id"], s["slew"]["from"], s["slew"]["seconds"],
+              s["start_time"], s["end_time"]) for s in steps],
+            [(1, "NIGHT_START", 0, 0, 1),
+             (99, 1, 4, 5, 6),
+             (7, 99, 0, 6, 7)],
+        )
+        self.assertMatchesBrute(relabeled)
+
+    def test_fuzz_nine_targets_against_brute(self):
+        # The pruning bug only activated with >= 9 alive targets; keep a
+        # permanent randomized cross-check at exactly that size.
+        rng = random.Random(20260922)
+        for _ in range(8):
+            n = 9
+            ids = rng.sample(range(-40, 120), n)
+            d = [rng.randint(1, 5) for _ in range(n)]
+            v = [rng.randint(1, 9) for _ in range(n)]
+            w = []
+            for _ in range(n):
+                ws = []
+                for _ in range(rng.randint(1, 3)):
+                    lo = rng.randint(0, 12)
+                    ws.append((lo, lo + rng.randint(0, 9)))
+                w.append(ws)
+            s0 = [rng.randint(0, 8) for _ in range(n)]
+            sm = [[rng.choice([0, 0, 1, 4, 20]) for _ in range(n)]
+                  for _ in range(n)]
+            raw = make_raw(n, d, v, w, s0, sm, ids=ids)
+            self.assertMatchesBrute(raw)
+            perm = list(range(n))
+            rng.shuffle(perm)
+            self.assertMatchesBrute(self._reorder(raw, perm))
+
+
     # ------------------------------------------------------------- invalid
 
     def _expect_error(self, raw):

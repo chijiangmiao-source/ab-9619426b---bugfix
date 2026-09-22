@@ -26,9 +26,12 @@ target's membership across all plans tied on criteria 1+2:
 ``required`` / ``optional`` / ``excluded``.
 
 Algorithm: subset DP over ``(mask, last)`` storing the earliest achievable
-end time; a reverse reachability closure over optimal masks collects every
-state lying on an optimal plan; the canonical sequence is recovered by
-greedy smallest-id extension inside that closure.  Pure standard library.
+end time.  Within each mask a sound Pareto frontier drops only states that
+reach every target no later than another ordering of the *same* mask;
+pruning across distinct masks is never valid because values are positive.
+Optimality witnesses for lexicographic reconstruction are then found by an
+on-demand dp-tight DFS that falls back to a full reverse closure if the
+optimal-plan region turns out to be dense.  Pure standard library.
 """
 
 from __future__ import annotations
@@ -178,41 +181,6 @@ def _earliest_start(windows, ready: int, duration: int):
     return best
 
 
-class _StateFrontier:
-    """Keep the useful value/time labels for each possible final target."""
-
-    __slots__ = ("enabled", "labels")
-
-    def __init__(self, target_count: int, enabled: bool):
-        self.enabled = enabled
-        self.labels = [[] for _ in range(target_count)]
-
-    def admit(self, last: int, mask: int, value: int, end: int) -> bool:
-        if not self.enabled:
-            return True
-
-        labels = self.labels[last]
-        for known_mask, known_value, known_end in labels:
-            if (
-                known_mask != mask
-                and known_value >= value
-                and known_end <= end
-            ):
-                return False
-
-        retained = []
-        for known_mask, known_value, known_end in labels:
-            if (
-                known_mask == mask
-                or known_value > value
-                or known_end < end
-            ):
-                retained.append((known_mask, known_value, known_end))
-        retained.append((mask, value, end))
-        self.labels[last] = retained
-        return True
-
-
 def plan(raw_request: dict) -> dict:
     ids, durations, values, windows, slew_night, slew = _validate(raw_request)
     n = len(ids)
@@ -251,6 +219,12 @@ def plan(raw_request: dict) -> dict:
     latest_ready = [
         max(hi for lo, hi in wins[k]) - dur[k] for k in range(m)
     ]
+    # Single-window targets admit a pure arithmetic feasibility check:
+    # (open, latest-ready).  Others fall back to the window scan/cache.
+    single = [
+        (wins[k][0][0], wins[k][0][1] - dur[k]) if len(wins[k]) == 1 else None
+        for k in range(m)
+    ]
 
     # First-observation seeds (slew directly from the night origin).
     first_end = [UNREACH] * m
@@ -269,57 +243,213 @@ def plan(raw_request: dict) -> dict:
     # ending in `last`.  Iterating masks in numeric order is a topological
     # order since every transition adds one bit (mask | bit > mask).
     dp = [UNREACH] * (size * m)
+    # Incremental within-mask frontier summary, fed on every dp write:
+    # while a mask has a single non-dominated state it is cached in
+    # hint_last/hint_end and needs no member scan at all; once two
+    # incomparable states appear the mask is flagged multi and its frontier
+    # is rebuilt authoritatively from dp.  Hints are only an optimization --
+    # the multi-path recompute never trusts them.
+    hint_last = [-1] * size
+    hint_end = [-1] * size
+    multi = bytearray(size)
     for i in range(m):
         if first_end[i] != UNREACH:
-            dp[(1 << i) * m + i] = first_end[i]
+            p = (1 << i) * m + i
+            dp[p] = first_end[i]
+            hint_last[1 << i] = i
+            hint_end[1 << i] = first_end[i]
+
+    # dmax[a][b] = max over all targets j of (slew[b][j] - slew[a][j]).
+    # A state ending in b with end e_b reaches every target no later than a
+    # state ending in a with end e_a iff dmax[a][b] <= e_a - e_b.  Using all
+    # j (rather than only not-yet-used targets) only makes the test a
+    # sufficient -- never a necessary -- condition, so it stays exact.
+    dmax = [[0] * m for _ in range(m)]
+    for a in range(m):
+        ra = sm[a]
+        for b in range(m):
+            rb = sm[b]
+            d = 0
+            for j in range(m):
+                diff = rb[j] - ra[j]
+                if diff > d:
+                    d = diff
+            dmax[a][b] = d
 
     # Hot transition loop, kept flat (local aliases, tuple windows).
     _wins, _dur, _sm = wins, dur, sm
     _lsb, _off = lsb_index, offset_k
     _latest = latest_ready
+    _single = single
+    _dmax = dmax
+    _unreach = UNREACH
     # Memoize earliest start per (target, slew-finish time): the same ready
-    # time recurs across many predecessor masks; feasible start depends
-    # only on the target's windows and ready. -2 caches "infeasible".
+    # time recurs across many (mask, predecessor) pairs; feasibility of a
+    # target depends only on its windows and the ready time. -2 = infeasible.
     ready_cache = [dict() for _ in range(m)]
-    state_frontier = _StateFrontier(m, size >= 512)
+    cache_get = [c.get for c in ready_cache]
+    scratch = [0] * m  # per-mask minimum slew-ready time per next target
+    INF = 1 << 62
+
+    def _publish(nmask, nxt, new_end):
+        """Fold a dp state into the target mask's frontier summary.
+
+        Only used by the (rare) multi-frontier path; the hot path inlines
+        this to avoid a call per transition.
+        """
+        if multi[nmask]:
+            return
+        hl = hint_last[nmask]
+        if hl < 0:
+            hint_last[nmask] = nxt
+            hint_end[nmask] = new_end
+        elif hl == nxt:
+            hint_end[nmask] = new_end
+        elif _dmax[nxt][hl] <= new_end - hint_end[nmask]:
+            pass  # cached state reaches every target no later
+        elif _dmax[hl][nxt] <= hint_end[nmask] - new_end:
+            hint_last[nmask] = nxt
+            hint_end[nmask] = new_end
+        else:
+            multi[nmask] = 1  # rebuild later
+
     for mask in range(1, size):
         base = mask * m
-        remaining = full ^ mask
+        cand = full ^ mask
+        if not multi[mask]:
+            f_last = hint_last[mask]
+            if f_last < 0:
+                continue
+            f_end = hint_end[mask]
+            # Tight path: a single non-dominated ordering of this mask.
+            row = _sm[f_last]
+            c = cand
+            while c:
+                b = c & -c
+                c ^= b
+                nxt = _lsb[b]
+                best_ready = f_end + row[nxt]
+                sw = _single[nxt]
+                if sw is not None:
+                    lo0, cap = sw
+                    if best_ready > cap:
+                        continue
+                    st = best_ready if best_ready > lo0 else lo0
+                else:
+                    if best_ready > _latest[nxt]:
+                        continue
+                    st = cache_get[nxt](best_ready)
+                    if st is None:
+                        st = -2
+                        for lo, hi in _wins[nxt]:
+                            t = lo if best_ready <= lo else best_ready
+                            if t + _dur[nxt] <= hi and (st < 0 or t < st):
+                                st = t
+                        ready_cache[nxt][best_ready] = st
+                if st >= 0:
+                    p = base + _off[nxt]
+                    new_end = st + _dur[nxt]
+                    old_end = dp[p]
+                    if old_end == _unreach or new_end < old_end:
+                        dp[p] = new_end
+                        nmask = mask | b
+                        if not multi[nmask]:
+                            hl = hint_last[nmask]
+                            if hl < 0:
+                                hint_last[nmask] = nxt
+                                hint_end[nmask] = new_end
+                            elif hl == nxt:
+                                hint_end[nmask] = new_end
+                            elif _dmax[nxt][hl] <= new_end - hint_end[nmask]:
+                                pass  # cached state reaches every target no later
+                            elif _dmax[hl][nxt] <= hint_end[nmask] - new_end:
+                                hint_last[nmask] = nxt
+                                hint_end[nmask] = new_end
+                            else:
+                                multi[nmask] = 1  # rebuild later
+            continue
+
+        # General path: rebuild the sound within-mask Pareto frontier from
+        # dp.  (e2, l2) makes (end, last) redundant when it reaches every
+        # target no later; both states have observed exactly `mask`.
+        # Cross-mask comparison would conflate distinct target sets (values
+        # are positive) and is never done.
+        retained = []
         members = mask
         while members:
             b = members & -members
             members ^= b
             last = _lsb[b]
             end = dp[base + last]
-            if end == UNREACH:
+            if end == _unreach:
                 continue
-            if not state_frontier.admit(
-                last, mask, subset_value[mask], end
-            ):
-                continue
-            row = _sm[last]
-            cand = remaining
-            while cand:
-                cb = cand & -cand
-                cand ^= cb
-                nxt = _lsb[cb]
-                ready = end + row[nxt]
-                if ready > _latest[nxt]:
+            dominated = False
+            i = 0
+            while i < len(retained):
+                e2, l2 = retained[i]
+                if _dmax[last][l2] <= end - e2:
+                    dominated = True
+                    break
+                if _dmax[l2][last] <= e2 - end:
+                    retained[i] = retained[-1]
+                    retained.pop()
                     continue
-                st = ready_cache[nxt].get(ready)
+                i += 1
+            if not dominated:
+                retained.append((end, last))
+        if not retained:
+            continue
+
+        # Min slew-ready time to each still-unobserved target over the
+        # frontier.  Only the earliest predecessor can produce the earliest
+        # end of state (mask | nxt, nxt): feasibility is monotone in ready.
+        c = cand
+        while c:
+            b = c & -c
+            c ^= b
+            scratch[_lsb[b]] = INF
+        for end, last in retained:
+            row = _sm[last]
+            c = cand
+            while c:
+                b = c & -c
+                c ^= b
+                nxt = _lsb[b]
+                ready = end + row[nxt]
+                if ready < scratch[nxt]:
+                    scratch[nxt] = ready
+
+        c = cand
+        while c:
+            b = c & -c
+            c ^= b
+            nxt = _lsb[b]
+            best_ready = scratch[nxt]
+            sw = _single[nxt]
+            if sw is not None:
+                lo0, cap = sw
+                if best_ready > cap:
+                    continue
+                st = best_ready if best_ready > lo0 else lo0
+            else:
+                if best_ready > _latest[nxt]:
+                    continue
+                st = cache_get[nxt](best_ready)
                 if st is None:
                     # Earliest feasible start across at most three windows.
                     st = -2
                     for lo, hi in _wins[nxt]:
-                        t = lo if ready <= lo else ready
+                        t = lo if best_ready <= lo else best_ready
                         if t + _dur[nxt] <= hi and (st < 0 or t < st):
                             st = t
-                    ready_cache[nxt][ready] = st
-                if st >= 0:
-                    p = base + _off[nxt]  # (mask | cb) * m + nxt
-                    old = dp[p]
-                    if old == UNREACH or st + _dur[nxt] < old:
-                        dp[p] = st + _dur[nxt]
+                    ready_cache[nxt][best_ready] = st
+            if st >= 0:
+                p = base + _off[nxt]  # (mask | b) * m + nxt
+                new_end = st + _dur[nxt]
+                old_end = dp[p]
+                if old_end == _unreach or new_end < old_end:
+                    dp[p] = new_end
+                    _publish(mask | b, nxt, new_end)
 
     # Criteria 1+2 over all reachable masks (the empty mask always is).
     best_value = 0
@@ -345,52 +475,130 @@ def plan(raw_request: dict) -> dict:
         elif v == best_value and e == best_end:
             optimal_masks.add(mask)
 
-    # Reverse closure: good[mask,last] lies on at least one ordering that
-    # starts at a seed, realizes the dp earliest times, and ends (at an
-    # optimal mask) at best_end.
-    good = bytearray(size * m)
-    stack = []
-    for om in optimal_masks:
-        if om == 0:
-            continue
-        base = om * m
-        x = om
-        while x:
-            b = x & -x
-            x ^= b
-            last = lsb_index[b]
-            if dp[base + last] == best_end:
-                p = base + last
-                if not good[p]:
-                    good[p] = 1
-                    stack.append((om, last))
+    # On-demand optimality witness test: can state (mask, last) be extended,
+    # using only dp-tight transitions, to an optimal mask ending at
+    # best_end?  Only states visited by the lexicographic reconstruction are
+    # ever queried; in dense all-tie cases a witness path is found after a
+    # handful of steps.  If proving the answers starts exploring most of the
+    # state space, one flat full reverse closure is built instead and all
+    # further lookups read it.  Single-window targets use pure arithmetic.
+    finish_yes = bytearray(size * m)
+    in_optimal = optimal_masks.__contains__
+    closure_done = False
+    expanded = 0
+    EXPAND_BUDGET = 256  # witness paths are at most n steps each
 
-    while stack:
-        mask, last = stack.pop()
-        prev_mask = mask ^ (1 << last)
-        if prev_mask == 0:
-            continue
-        cur_end = dp[mask * m + last]
-        base = prev_mask * m
-        x = prev_mask
-        while x:
-            b = x & -x
-            x ^= b
-            prev = lsb_index[b]
-            prev_end = dp[base + prev]
-            if prev_end == UNREACH:
-                continue
-            ready = prev_end + sm[prev][last]
-            st = -1
-            for lo, hi in wins[last]:
+    def _tight_start(last, nxt, end):
+        ready = end + sm[last][nxt]
+        sw = single[nxt]
+        if sw is not None:
+            lo, cap = sw
+            if ready > cap:
+                return -1
+            return ready if ready > lo else lo
+        if ready > latest_ready[nxt]:
+            return -1
+        st = ready_cache[nxt].get(ready)
+        if st is None:
+            st = -2
+            for lo, hi in wins[nxt]:
                 t = ready if ready > lo else lo
-                if t + dur[last] <= hi and (st < 0 or t < st):
+                if t + dur[nxt] <= hi and (st < 0 or t < st):
                     st = t
-            if st >= 0 and st + dur[last] == cur_end:
-                p = base + prev
-                if not good[p]:
-                    good[p] = 1
-                    stack.append((prev_mask, prev))
+            ready_cache[nxt][ready] = st
+        return st
+
+    def _build_full_closure():
+        # Stack-based reverse closure: seed every optimal-mask state at
+        # best_end, walk predecessor edges whose dp arrival is tight.  Cheap
+        # when the good region is sparse; marks dominated intermediates too.
+        good = finish_yes
+        stack = []
+        for om in optimal_masks:
+            if om == 0:
+                continue
+            base = om * m
+            x = om
+            while x:
+                b = x & -x
+                x ^= b
+                last = lsb_index[b]
+                if dp[base + last] == best_end:
+                    p = base + last
+                    if not good[p]:
+                        good[p] = 1
+                        stack.append((om, last))
+        while stack:
+            fmask, last = stack.pop()
+            prev_mask = fmask ^ (1 << last)
+            if prev_mask == 0:
+                continue
+            target_start = dp[fmask * m + last] - dur[last]
+            base = prev_mask * m
+            x = prev_mask
+            while x:
+                b = x & -x
+                x ^= b
+                prev = lsb_index[b]
+                prev_end = dp[base + prev]
+                if prev_end == UNREACH:
+                    continue
+                st = _tight_start(prev, last, prev_end)
+                if st == target_start:
+                    p = base + prev
+                    if not good[p]:
+                        good[p] = 1
+                        stack.append((prev_mask, prev))
+
+    def can_finish(mask, last):
+        nonlocal closure_done, expanded
+        p0 = mask * m + last
+        if finish_yes[p0]:
+            return True
+        if in_optimal(mask) and dp[p0] == best_end:
+            finish_yes[p0] = 1
+            return True
+        if closure_done:
+            return False  # full closure is authoritative
+        # Explicit-stack DFS over the strictly-growing mask DAG.  Frames are
+        # (mask, last, end, successor-bits-left).
+        stack = [(mask, last, dp[p0], full ^ mask)]
+        trail = [p0]
+        answer = False
+        while stack:
+            fm, fl, fend, c = stack[-1]
+            if c:
+                b = c & -c
+                stack[-1] = (fm, fl, fend, c ^ b)
+                nxt = lsb_index[b]
+                st = _tight_start(fl, nxt, fend)
+                if st < 0:
+                    continue
+                nmask = fm | b
+                np = nmask * m + nxt
+                if st + dur[nxt] != dp[np]:
+                    continue  # not dp-tight: a better arrival exists
+                if finish_yes[np]:
+                    answer = True
+                    break
+                if in_optimal(nmask) and dp[np] == best_end:
+                    finish_yes[np] = 1
+                    answer = True
+                    break
+                expanded += 1
+                if expanded > EXPAND_BUDGET:
+                    _build_full_closure()
+                    closure_done = True
+                    return bool(finish_yes[p0])
+                stack.append((nmask, nxt, dp[np], full ^ nmask))
+                trail.append(np)
+            else:
+                stack.pop()
+                trail.pop()
+        if answer:
+            for p in trail:
+                finish_yes[p] = 1
+        return answer
 
     # Membership of every target across all criteria-1+2 optimal plans.
     ever_in = 0
@@ -399,8 +607,16 @@ def plan(raw_request: dict) -> dict:
         ever_in |= om
         ever_out |= full ^ om
 
+    class _Witness:
+        """good-state lookup backed by the memoized witness DFS/closure."""
+
+        __slots__ = ()
+
+        def __getitem__(self, p):
+            return 1 if can_finish(p // m, p % m) else 0
+
     canonical_steps, canonical_ids = _canonical(
-        m, ids, alive, dur, wins, s0, sm, dp, good, optimal_masks
+        m, ids, alive, dur, wins, s0, sm, dp, _Witness(), optimal_masks
     )
 
     classifications = []
@@ -437,12 +653,13 @@ def plan(raw_request: dict) -> dict:
     }
 
 
-def _canonical(m, ids, alive, dur, wins, s0, sm, dp, good, optimal_masks):
+def _canonical(m, ids, alive, dur, wins, s0, sm, dp, can_witness, optimal_masks):
     """Greedy reconstruction of the lexicographically smallest optimal plan.
 
-    At each position take the smallest id whose next state is in the reverse
-    closure; the earliest-start timeline is then forced (dp times), so each
-    sequence has exactly one reported schedule.
+    At each position take the smallest id whose next state admits an
+    optimality witness (a dp-tight continuation to an optimal mask); the
+    earliest-start timeline is then forced (dp times), so each sequence has
+    exactly one reported schedule.
     """
     # Compressed indices ordered by user-facing target id.
     order = sorted(range(m), key=lambda k: ids[alive[k]])
@@ -472,7 +689,7 @@ def _canonical(m, ids, alive, dur, wins, s0, sm, dp, good, optimal_masks):
                 continue
             new_mask = mask | bit
             end = dp[new_mask * m + k]
-            if end == UNREACH or not good[new_mask * m + k]:
+            if end == UNREACH or not can_witness[new_mask * m + k]:
                 continue
             ready = s0[k] if last == -1 else prev_end + sm[last][k]
             st, _ = earliest_with_window(k, ready)

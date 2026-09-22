@@ -167,11 +167,16 @@ returned. Malformed JSON yields `{"error": "invalid_json"}`.
 2. Subset DP over `(observed-mask, last-target)` storing the earliest
    achievable exposure end time. Each transition appends one target:
    slew after the previous end, then earliest legal start in any window.
+   Per mask, only states that another ordering of the *same* mask reaches
+   every target no later than are discarded (a sound within-mask Pareto
+   frontier); states of distinct masks are never compared, since positive
+   values make cross-set pruning invalid.
 3. Scan all reachable masks to select those maximizing value and, among
    them, minimizing end time.
-4. Reverse reachability from the optimal masks marks every DP state that
-   lies on at least one optimal plan; membership across those states gives
-   required / optional / excluded.
+4. Required/optional/excluded membership is read directly from the set of
+   optimal masks; an on-demand dp-tight witness DFS (falling back to a full
+   reverse closure when the optimal-plan region is dense) marks the states
+   the lex reconstruction may walk through.
 5. Greedy smallest-id walk through the marked states reconstructs the
    unique lexicographically smallest plan, with a fully determined timeline
    (earliest legal start at every step).
