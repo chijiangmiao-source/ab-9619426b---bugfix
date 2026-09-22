@@ -8,7 +8,7 @@ target is a robust pick or merely an artifact of the tie-breaking rules.
 
 * Python 3 standard library only — no third-party packages, **no general
   optimization solver**, no front end, no online service calls.
-* Exact subset dynamic programming (n ≤ 18 runs in about a second).
+* Exact subset dynamic programming (n = 18 runs in a few seconds).
 * Docker + Docker Compose, container health check, configurable host port.
 
 ## Run
@@ -169,9 +169,12 @@ returned. Malformed JSON yields `{"error": "invalid_json"}`.
    slew after the previous end, then earliest legal start in any window.
 3. Scan all reachable masks to select those maximizing value and, among
    them, minimizing end time.
-4. Reverse reachability from the optimal masks marks every DP state that
-   lies on at least one optimal plan; membership across those states gives
-   required / optional / excluded.
-5. Greedy smallest-id walk through the marked states reconstructs the
-   unique lexicographically smallest plan, with a fully determined timeline
-   (earliest legal start at every step).
+4. A backward pass over subsets of the optimal masks computes, for every
+   `(mask, last-target)` state, the latest exposure end time that can
+   still be completed into an optimal plan (completability is monotone in
+   the arrival time, so one deadline per state is exact). Membership
+   across the optimal masks gives required / optional / excluded.
+5. Greedy smallest-id walk through states whose earliest-start arrival
+   meets the deadline reconstructs the unique lexicographically smallest
+   plan, with a fully determined timeline (earliest legal start at every
+   step).

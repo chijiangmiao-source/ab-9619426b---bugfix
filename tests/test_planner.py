@@ -7,6 +7,62 @@ import unittest
 from app.planner import PlanError, Window, plan
 
 
+def reported_scenario():
+    """The 9-target request from the bug report: the optimum chains
+    10 -> 30 -> 20 (value 16, end 7), which only exists via a follow-up
+    combination that used to be pruned away on larger target sets."""
+    return {
+        "targets": [
+            {"id": 20, "duration": 1, "value": 10,
+             "windows": [{"open": 0, "close": 10}]},
+            {"id": 10, "duration": 1, "value": 5,
+             "windows": [{"open": 0, "close": 1}]},
+            {"id": 30, "duration": 1, "value": 1,
+             "windows": [{"open": 0, "close": 10}]},
+            {"id": 40, "duration": 1, "value": 1,
+             "windows": [{"open": 0, "close": 1}]},
+            {"id": 41, "duration": 1, "value": 1,
+             "windows": [{"open": 0, "close": 1}]},
+            {"id": 42, "duration": 1, "value": 1,
+             "windows": [{"open": 0, "close": 1}]},
+            {"id": 43, "duration": 1, "value": 1,
+             "windows": [{"open": 0, "close": 1}]},
+            {"id": 44, "duration": 1, "value": 1,
+             "windows": [{"open": 0, "close": 1}]},
+            {"id": 45, "duration": 1, "value": 1,
+             "windows": [{"open": 0, "close": 1}]},
+        ],
+        "slew": {
+            "from_night_start": [0, 0, 100, 100, 100, 100, 100, 100, 100],
+            "between_targets": [
+                [0, 100, 0, 100, 100, 100, 100, 100, 100],
+                [100, 0, 4, 100, 100, 100, 100, 100, 100],
+                [0, 100, 0, 100, 100, 100, 100, 100, 100],
+                [100, 100, 100, 0, 100, 100, 100, 100, 100],
+                [100, 100, 100, 100, 0, 100, 100, 100, 100],
+                [100, 100, 100, 100, 100, 0, 100, 100, 100],
+                [100, 100, 100, 100, 100, 100, 0, 100, 100],
+                [100, 100, 100, 100, 100, 100, 100, 0, 100],
+                [100, 100, 100, 100, 100, 100, 100, 100, 0],
+            ],
+        },
+    }
+
+
+def permute_request(raw, perm):
+    """Same instance, targets array reordered: perm[new_index] = old_index."""
+    targets = raw["targets"]
+    s0 = raw["slew"]["from_night_start"]
+    sm = raw["slew"]["between_targets"]
+    return {
+        "targets": [targets[i] for i in perm],
+        "slew": {
+            "from_night_start": [s0[i] for i in perm],
+            "between_targets": [[sm[i][j] for j in perm] for i in perm],
+        },
+    }
+
+
 def earliest(windows, ready, duration):
     best = None
     for lo, hi in windows:
@@ -320,6 +376,110 @@ class TestPlanner(unittest.TestCase):
         self.assertEqual(s2["slew"]["finish_time"], 8)
         self.assertEqual((s2["start_time"], s2["end_time"]), (8, 11))
 
+    def test_reported_nine_target_scenario(self):
+        # Regression: legal follow-up combinations were pruned on larger
+        # target sets, losing the global optimum [10, 30, 20].
+        res = plan(reported_scenario())
+        self.assertEqual(res["objective"],
+                         {"total_value": 16, "final_end_time": 7})
+        self.assertEqual(res["canonical_plan"]["target_ids"], [10, 30, 20])
+        self.assertEqual(res["optimal_target_set_count"], 1)
+        self.assertFalse(res["empty_plan"])
+
+        statuses = {c["id"]: c["status"] for c in res["classifications"]}
+        self.assertEqual(
+            statuses,
+            {20: "required", 10: "required", 30: "required",
+             40: "excluded", 41: "excluded", 42: "excluded",
+             43: "excluded", 44: "excluded", 45: "excluded"},
+        )
+
+        # Every step's slew source, finish time, exposure interval and
+        # window evidence recomputes from the request.
+        steps = res["canonical_plan"]["steps"]
+        self.assertEqual(
+            [(s["id"], s["slew"]["from"], s["slew"]["seconds"],
+              s["slew"]["finish_time"], s["start_time"], s["end_time"],
+              (s["window"]["open"], s["window"]["close"])) for s in steps],
+            [(10, "NIGHT_START", 0, 0, 0, 1, (0, 1)),
+             (30, 10, 4, 5, 5, 6, (0, 10)),
+             (20, 30, 0, 6, 6, 7, (0, 10))],
+        )
+        prev_end = 0
+        for s in steps:
+            self.assertEqual(s["slew"]["finish_time"],
+                             prev_end + s["slew"]["seconds"])
+            self.assertGreaterEqual(s["start_time"], s["slew"]["finish_time"])
+            self.assertEqual(s["end_time"],
+                             s["start_time"] + s["exposure_seconds"])
+            self.assertLessEqual(s["window"]["open"], s["start_time"])
+            self.assertLessEqual(s["end_time"], s["window"]["close"])
+            prev_end = s["end_time"]
+        self.assertEqual(prev_end, res["objective"]["final_end_time"])
+
+    def test_result_independent_of_request_target_order(self):
+        raw = reported_scenario()
+        reference = plan(raw)
+        want_status = {c["id"]: c["status"] for c in reference["classifications"]}
+        rng = random.Random(20260922)
+        n = len(raw["targets"])
+        for _ in range(12):
+            perm = list(range(n))
+            rng.shuffle(perm)
+            res = plan(permute_request(raw, perm))
+            self.assertEqual(res["objective"], reference["objective"])
+            self.assertEqual(res["canonical_plan"],
+                             reference["canonical_plan"])
+            self.assertEqual(res["optimal_target_set_count"],
+                             reference["optimal_target_set_count"])
+            self.assertEqual(
+                {c["id"]: c["status"] for c in res["classifications"]},
+                want_status,
+            )
+
+    def test_renumbered_ids_select_same_business_combination(self):
+        raw = reported_scenario()
+        id_map = {20: 7, 10: 900, 30: 55,
+                  40: -3, 41: -2, 42: -1, 43: 0, 44: 1, 45: 2}
+        renumbered = {
+            "targets": [
+                {**t, "id": id_map[t["id"]]} for t in raw["targets"]
+            ],
+            "slew": raw["slew"],
+        }
+        res = plan(renumbered)
+        self.assertEqual(res["objective"],
+                         {"total_value": 16, "final_end_time": 7})
+        # Same business combination {10, 30, 20}, expressed in the new ids.
+        self.assertEqual(res["canonical_plan"]["target_ids"], [900, 55, 7])
+        self.assertEqual(res["optimal_target_set_count"], 1)
+        statuses = {c["id"]: c["status"] for c in res["classifications"]}
+        self.assertEqual(
+            statuses,
+            {7: "required", 900: "required", 55: "required",
+             -3: "excluded", -2: "excluded", -1: "excluded",
+             0: "excluded", 1: "excluded", 2: "excluded"},
+        )
+
+    def test_canonical_lex_smallest_with_slack_prefix(self):
+        # Sequence [1,2,3,4] is optimal (value 4, end 9) even though its
+        # prefix {1,2,3} ends at 8 while another ordering of that prefix
+        # ends at 3.  The canonical plan must still be the lexicographically
+        # smallest optimal sequence, not [2,1,3,4].
+        raw = make_raw(
+            n=4,
+            d=[1, 1, 1, 1],
+            v=[1, 1, 1, 1],
+            w=[[(0, 100)], [(0, 100)], [(0, 100)], [(8, 9)]],
+            s0=[5, 0, 0, 0],
+            sm=[[0] * 4 for _ in range(4)],
+        )
+        res = plan(raw)
+        self.assertEqual(res["objective"],
+                         {"total_value": 4, "final_end_time": 9})
+        self.assertEqual(res["canonical_plan"]["target_ids"], [1, 2, 3, 4])
+        self.assertMatchesBrute(raw)
+
     def test_fuzz_against_brute_force(self):
         rng = random.Random(20260919)
         for case in range(120):
@@ -340,6 +500,69 @@ class TestPlanner(unittest.TestCase):
             sm = [[rng.randint(0, 6) for _ in range(n)] for _ in range(n)]
             raw = make_raw(n, d, v, w, s0, sm, ids=ids)
             self.assertMatchesBrute(raw)
+
+    def test_fuzz_larger_sets_against_brute_force(self):
+        # n >= 9 targets (all kept alive by construction) exercise the
+        # combinatorial regime where follow-up combinations used to be
+        # pruned away.  Brute force is still affordable at these sizes.
+        rng = random.Random(20260920)
+        for case in range(10):
+            n = rng.choice([8, 9])
+            ids = rng.sample(range(-30, 90), n)
+            d = [rng.randint(1, 4) for _ in range(n)]
+            v = [rng.randint(1, 9) for _ in range(n)]
+            w = []
+            for i in range(n):
+                k = rng.randint(1, 2)  # at least one window: target stays alive
+                ws = []
+                for _ in range(k):
+                    lo = rng.randint(0, 10)
+                    hi = lo + rng.randint(2, 9)
+                    ws.append((lo, hi))
+                w.append(ws)
+            s0 = [rng.randint(0, 6) for _ in range(n)]
+            sm = [[rng.randint(0, 5) for _ in range(n)] for _ in range(n)]
+            raw = make_raw(n, d, v, w, s0, sm, ids=ids)
+            self.assertMatchesBrute(raw)
+
+    def test_fuzz_permutation_invariance(self):
+        # Shuffling the request's target array (and its slew matrices) must
+        # not change the objective, the canonical plan, or classifications.
+        rng = random.Random(20260921)
+        for case in range(12):
+            n = rng.randint(2, 9)
+            ids = rng.sample(range(-30, 90), n)
+            d = [rng.randint(1, 4) for _ in range(n)]
+            v = [rng.randint(1, 9) for _ in range(n)]
+            w = []
+            for i in range(n):
+                k = rng.randint(1, 2)
+                ws = []
+                for _ in range(k):
+                    lo = rng.randint(0, 10)
+                    hi = lo + rng.randint(2, 9)
+                    ws.append((lo, hi))
+                w.append(ws)
+            s0 = [rng.randint(0, 6) for _ in range(n)]
+            sm = [[rng.randint(0, 5) for _ in range(n)] for _ in range(n)]
+            raw = make_raw(n, d, v, w, s0, sm, ids=ids)
+            reference = plan(raw)
+            want_status = {
+                c["id"]: c["status"] for c in reference["classifications"]
+            }
+            for _ in range(3):
+                perm = list(range(n))
+                rng.shuffle(perm)
+                res = plan(permute_request(raw, perm))
+                self.assertEqual(res["objective"], reference["objective"])
+                self.assertEqual(res["canonical_plan"],
+                                 reference["canonical_plan"])
+                self.assertEqual(res["optimal_target_set_count"],
+                                 reference["optimal_target_set_count"])
+                self.assertEqual(
+                    {c["id"]: c["status"] for c in res["classifications"]},
+                    want_status,
+                )
 
     # ------------------------------------------------------------- invalid
 
